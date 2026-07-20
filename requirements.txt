@@ -1,6 +1,4 @@
 flask
+google-genai
+line-bot-sdk>=3.0.0
 gunicorn
-line-bot-sdk
-google-generativeai
-gspread
-oauth2client
