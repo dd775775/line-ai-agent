@@ -1,46 +1,38 @@
 import os
-import json
 from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import google.generativeai as genai
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent
 
 app = Flask(__name__)
 
-# 1. 環境變數讀取
-LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
+# 從環境變數取得金鑰
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# LINE SDK 初始化
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# Gemini AI 初始化
+# 初始化 Google Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Google Sheet 初始化 (讀取 JSON 服務帳號金鑰)
-def get_google_sheet():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    if creds_json:
-        creds_dict = json.loads(creds_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
-        return client.open_by_key(GOOGLE_SHEET_ID)
-    return None
+# 系統指令人設 (保險經紀人特助)
+SYSTEM_INSTRUCTION = """
+你是一位專業、親切且有溫度的保險經紀人AI助理。你的任務是代表保險經紀人顧問在第一時間回應客戶。
 
-# 記憶暫存 (簡單短期記憶)
-user_sessions = {}
+【主要任務】
+1. 對現有客戶：提供親切招呼，解答常見保險觀念（如醫療險、實支實付、車險流程）。
+2. 對轉介紹的新客人：展現熱情，感謝對方諮詢，並禮貌詢問稱呼、介紹人及主要想了解的保障需求。
+3. 絕不做出具體保費報價或保證承保承諾，並告知顧問會盡快親自聯繫。
+"""
+
+# 使用官方標準 gemini-1.5-flash 模型
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash',
+    system_instruction=SYSTEM_INSTRUCTION
+)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -52,108 +44,28 @@ def callback():
         abort(400)
     return 'OK'
 
-# 🌟 1. 新用戶加入 (FollowEvent) 分流邏輯
-@handler.add(FollowEvent)
-def handle_follow(event):
-    user_id = event.source.user_id
-    sheet = get_google_sheet()
-    
-    is_old_customer = False
-    if sheet:
-        try:
-            wks = sheet.worksheet("客戶名單與體況")
-            records = wks.get_all_records()
-            for r in records:
-                if str(r.get('LINE_User_ID')) == str(user_id):
-                    is_old_customer = True
-                    break
-        except Exception as e:
-            print("Sheet Error:", e)
-
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        if is_old_customer:
-            welcome_msg = "歡迎回來！我是您的數位保險特助。\n您可以輸入『查詢保單』查看摘要，或點選選單尋求專屬服務！"
-        else:
-            welcome_msg = (
-                "您好！我是大誠保險經紀人沈顧問的 AI 數位特助 🤖\n\n"
-                "歡迎加為好友！請問您這次是由哪位朋友介紹過來的呢？\n"
-                "或是想先了解哪一類型的保障規劃？（例如：醫療險、儲蓄理財、車險續保）"
-            )
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=welcome_msg)]
-            )
-        )
-
-# 🌟 2. 訊息處理與 AI 對話機制
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_id = event.source.user_id
-    user_msg = event.message.text.strip()
+    user_text = event.message.text
     
-    # 建立短期記憶 Session
-    if user_id not in user_sessions:
-        user_sessions[user_id] = []
-    user_sessions[user_id].append(f"客戶: {user_msg}")
-    
-    # 限制僅保留最近 6 條歷史紀錄
-    if len(user_sessions[user_id]) > 6:
-        user_sessions[user_id] = user_sessions[user_id][-6:]
-        
-    history_context = "\n".join(user_sessions[user_id])
-    sheet = get_google_sheet()
-
-    # 特殊觸發：查詢保單 (B方案隱私過濾)
-    if "查詢保單" in user_msg or "保單存摺" in user_msg:
-        reply_text = get_policy_summary(sheet, user_id)
-    else:
-        # Prompt 角色設定與對話導引
-        prompt = f"""
-你是一位專業、有溫度且值得信賴的大誠保險經紀人 AI 助手（服務顧問為沈經理）。
-請根據與客戶的對話紀錄親切回答。如果客戶提及體況，請引導其確認 A~D 體況分級。
-說話請保持簡潔、專利且富有禮貌。
-
-對話歷史：
-{history_context}
-
-請生成適當的回覆：
-"""
-        response = model.generate_content(prompt)
-        reply_text = response.text.strip()
-
-    user_sessions[user_id].append(f"AI: {reply_text}")
-
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
-            )
-        )
-
-# B 方案隱私保單過濾邏輯
-def get_policy_summary(sheet, user_id):
-    if not sheet:
-        return "資料庫連線中，請稍後再試。"
     try:
-        wks = sheet.worksheet("保單存摺 (B方案)")
-        records = wks.get_all_records()
-        user_policies = []
-        for r in records:
-            if str(r.get('LINE_User_ID')) == str(user_id):
-                # 判斷隱私開關
-                if str(r.get('隱私隱藏')).strip() != '是':
-                    user_policies.append(f"• {r.get('險種名稱')} ({r.get('投保公司')}): 狀態-{r.get('保單狀態/到期日')}")
-        
-        if user_policies:
-            return "【您的保障摘要紀錄】\n" + "\n".join(user_policies) + "\n\n註：部分隱私保護設定之保單不在此處列出。"
-        else:
-            return "查無您公開的保單資料，若需查詢私房/儲蓄型保單，請聯繫沈顧問本人專人協助。"
+        # 呼叫 Gemini AI
+        response = model.generate_content(user_text)
+        reply_text = response.text
     except Exception as e:
-        return "保單資料庫處理異常，請聯繫顧問。"
+        # 捕捉 AI 出錯訊息，避免 500 崩潰
+        print(f"Gemini API 出錯: {e}")
+        reply_text = f"您好！訊息已收到，保險顧問會儘速親自回覆您！（系統提示: {str(e)[:60]}）"
+
+    # 回傳給 LINE 使用者
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+    except Exception as line_e:
+        print(f"LINE 回傳訊息失敗: {line_e}")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
