@@ -28,12 +28,6 @@ SYSTEM_INSTRUCTION = """
 3. 絕不做出具體保費報價或保證承保承諾，並告知顧問會盡快親自聯繫。
 """
 
-# 使用官方標準 gemini-1.5-flash 模型
-model = genai.GenerativeModel(
-    model_name='models/gemini-1.5-flash',
-    system_instruction=SYSTEM_INSTRUCTION
-)
-
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature')
@@ -47,15 +41,27 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_text = event.message.text
+    reply_text = ""
     
-    try:
-        # 呼叫 Gemini AI
-        response = model.generate_content(user_text)
-        reply_text = response.text
-    except Exception as e:
-        # 捕捉 AI 出錯訊息，避免 500 崩潰
-        print(f"Gemini API 出錯: {e}")
-        reply_text = f"您好！訊息已收到，保險顧問會儘速親自回覆您！（系統提示: {str(e)[:60]}）"
+    # 嘗試多個可用模型名稱（避免單一模型 404）
+    candidate_models = ['gemini-pro', 'models/gemini-pro', 'gemini-1.5-pro']
+    
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=SYSTEM_INSTRUCTION
+            )
+            response = model.generate_content(user_text)
+            reply_text = response.text
+            break # 成功呼叫就跳出迴圈
+        except Exception as e:
+            print(f"模型 {model_name} 嘗試失敗: {e}")
+            last_error = str(e)
+
+    # 如果所有模型都失敗
+    if not reply_text:
+        reply_text = f"您好！訊息已收到，保險顧問會儘速親自回覆您！（系統提示: {last_error[:60]}）"
 
     # 回傳給 LINE 使用者
     try:
