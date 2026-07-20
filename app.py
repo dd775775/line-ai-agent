@@ -30,7 +30,7 @@ SYSTEM_INSTRUCTION = """
 
 # 使用官方標準 gemini-1.5-flash 模型
 model = genai.GenerativeModel(
-    model_name='gemini-1.5-flash',
+    model_name='models/gemini-1.5-flash',
     system_instruction=SYSTEM_INSTRUCTION
 )
 
